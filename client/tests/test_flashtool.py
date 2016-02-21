@@ -23,7 +23,15 @@ class FlashBinaryTestCase(unittest.TestCase):
     def setUp(self):
         mock = lambda m: patch(m).start()
         self.progressbar = mock('progressbar.ProgressBar')
-        self.print = mock('builtins.print')
+        # self.print = mock('builtins.print')
+        self.target = {'device_class': 'dummy',
+                       'base_address': 0x1000,
+                        'chunk_size': 2048,
+                        'flash_pages': [
+                            [0x0000, 0x1000],
+                            [0x1000, 0x1000],
+                            [0x2000, 0x1000]
+                         ]}
 
     def tearDown(self):
         patch.stopall()
@@ -33,13 +41,12 @@ class FlashBinaryTestCase(unittest.TestCase):
         Checks that a single page is erased before writing.
         """
         data = bytes(range(20))
-        address = 0x1000
-        device_class = 'dummy'
         destinations = [1]
 
-        flash_binary(self.fd, data, address, "dummy", destinations)
+        flash_binary(self.fd, data, self.target, destinations)
 
-        erase_command = encode_erase_flash_page(address, device_class)
+        erase_command = encode_erase_flash_page(self.target['base_address'],
+                                                self.target['device_class'])
         write.assert_any_call(self.fd, erase_command, destinations)
 
     def test_write_single_chunk(self, write):
@@ -47,13 +54,11 @@ class FlashBinaryTestCase(unittest.TestCase):
         Tests that a single chunk can be written.
         """
         data = bytes(range(20))
-        address = 0x1000
-        device_class = 'dummy'
         destinations = [1]
 
-        flash_binary(self.fd, data, address, "dummy", [1])
+        flash_binary(self.fd, data, self.target, [1])
 
-        write_command = encode_write_flash(data, address, device_class)
+        write_command = encode_write_flash(data, self.target['base_address'], self.target['device_class'])
 
         write.assert_any_call(self.fd, write_command, destinations)
 
@@ -62,11 +67,11 @@ class FlashBinaryTestCase(unittest.TestCase):
         Checks that we can write many chunks, but still in one page
         """
         data = bytes([0] * 4096)
-        address = 0x1000
-        device_class = 'dummy'
+        address = self.target['base_address']
+        device_class = self.target['device_class']
         destinations = [1]
 
-        flash_binary(self.fd, data, address, "dummy", [1])
+        flash_binary(self.fd, data, self.target, [1])
 
         write_command = encode_write_flash(bytes([0] * 2048), address, device_class)
         write.assert_any_call(self.fd, write_command, destinations)
@@ -78,15 +83,14 @@ class FlashBinaryTestCase(unittest.TestCase):
         """
         Checks that all pages are erased before writing data to them.
         """
-        data = bytes([0] * 4096)
-        device_class = 'dummy'
+        data = bytes([0] * 4096 * 2)
         destinations = [1]
 
-        flash_binary(self.fd, bytes([0] * 4096), 0x1000, device_class, destinations, page_size=2048)
+        flash_binary(self.fd, data, self.target, destinations)
 
         # Check that all pages were erased correctly
-        for addr in [0x1000, 0x1800]:
-            erase_command = encode_erase_flash_page(addr, device_class)
+        for addr in [0x1000, 0x2000]:
+            erase_command = encode_erase_flash_page(addr, self.target['device_class'])
             write.assert_any_call(self.fd, erase_command, destinations)
 
     @patch('utils.config_update_and_save')
@@ -97,7 +101,7 @@ class FlashBinaryTestCase(unittest.TestCase):
         data = bytes([0] * 10)
         dst = [1]
 
-        flash_binary(self.fd, data, 0x1000, '', dst)
+        flash_binary(self.fd, data, self.target, dst)
 
         expected_config = {'application_size': 10, 'application_crc': crc32(data)}
         conf.assert_any_call(self.fd, expected_config, dst)
@@ -114,7 +118,7 @@ class FlashBinaryTestCase(unittest.TestCase):
         data = bytes([0] * 10)
 
         with self.assertRaises(SystemExit):
-            flash_binary(None, data, 0x1000, '', [1, 2, 3])
+            flash_binary(None, data, self.target, [1, 2, 3])
 
         c.assert_any_call("Boards 1, 2 failed during page erase, aborting...")
 
@@ -132,7 +136,7 @@ class FlashBinaryTestCase(unittest.TestCase):
         data = bytes([0] * 10)
 
         with self.assertRaises(SystemExit):
-            flash_binary(None, data, 0x1000, '', [1, 2, 3])
+            flash_binary(None, data, self.target, [1, 2, 3])
 
         c.assert_any_call("Boards 1, 2 failed during page write, aborting...")
 
@@ -235,6 +239,10 @@ class MainTestCase(unittest.TestCase):
         self.check_online_boards = mock('bootloader_flash.check_online_boards')
         self.check_online_boards.side_effect = lambda f, b: set([1, 2, 3])
 
+        self.target = {'device_class': 'dummy', 'base_address': 0x1000}
+        self.read_target = mock('bootloader_flash.read_target_file')
+        self.read_target.return_value = self.target
+
         # Prepare binary file argument
         self.binary_data = bytes([0] * 10)
         self.open.return_value = BytesIO(self.binary_data)
@@ -243,7 +251,7 @@ class MainTestCase(unittest.TestCase):
         self.check.return_value = [1, 2, 3] # all boards are ok
 
         # Populate command line arguments
-        sys.argv = "test.py -b test.bin -a 0x1000 -p /dev/ttyUSB0 -c dummy 1 2 3".split()
+        sys.argv = "test.py -b test.bin -p /dev/ttyUSB0 -t dummy.yml 1 2 3".split()
 
     def tearDown(self):
         """
@@ -275,14 +283,14 @@ class MainTestCase(unittest.TestCase):
         Checks that the binary file is flashed correctly.
         """
         main()
-        self.flash.assert_any_call(self.conn, self.binary_data, 0x1000, 'dummy', [1,2,3])
+        self.flash.assert_any_call(self.conn, self.binary_data, self.target, [1,2,3])
 
     def test_check(self):
         """
         Checks that the flash is verified.
         """
         main()
-        self.check.assert_any_call(self.conn, self.binary_data, 0x1000, [1,2,3])
+        self.check.assert_any_call(self.conn, self.binary_data, self.target['base_address'], [1,2,3])
 
 
     def test_check_failed(self):
@@ -330,12 +338,11 @@ class ArgumentParsingTestCase(unittest.TestCase):
         """
         Tests the most simple case.
         """
-        commandline = "-b test.bin -a 0x1000 -p /dev/ttyUSB0 --run -c dummy 1 2 3"
+        commandline = "-b test.bin -p /dev/ttyUSB0 --run -t dummy.yml 1 2 3"
         args = parse_commandline_args(commandline.split())
         self.assertEqual('test.bin', args.binary_file)
-        self.assertEqual(0x1000, args.base_address)
         self.assertEqual('/dev/ttyUSB0', args.serial_device)
-        self.assertEqual('dummy', args.device_class)
+        self.assertEqual('dummy.yml', args.target)
         self.assertEqual([1,2,3], args.ids)
         self.assertTrue(args.run)
 
@@ -343,7 +350,7 @@ class ArgumentParsingTestCase(unittest.TestCase):
         """
         Checks that we can pass CAN interface
         """
-        commandline = "-b test.bin -a 0x1000 --interface /dev/can0 --run -c dummy 1 2 3"
+        commandline = "-b test.bin --interface /dev/can0 --run -t dummy.yml 1 2 3"
         args = parse_commandline_args(commandline.split())
         self.assertEqual(None, args.serial_device)
         self.assertEqual("/dev/can0", args.can_interface)
@@ -352,7 +359,7 @@ class ArgumentParsingTestCase(unittest.TestCase):
         """
         Checks that we have either a serial device or a CAN interface to use.
         """
-        commandline = "-b test.bin -a 0x1000 --run -c dummy 1 2 3"
+        commandline = "-b test.bin --run -t dummy.yml 1 2 3"
 
         with patch('argparse.ArgumentParser.error') as error:
             parse_commandline_args(commandline.split())
@@ -364,10 +371,48 @@ class ArgumentParsingTestCase(unittest.TestCase):
         """
         Checks that the serial device and the CAN interface are mutually exclusive.
         """
-        commandline = "-b test.bin -a 0x1000 -p /dev/ttyUSB0 --interface /dev/can0 --run -c dummy 1 2 3"
+        commandline = "-b test.bin -p /dev/ttyUSB0 --interface /dev/can0 --run -t dummy.yml 1 2 3"
 
         with patch('argparse.ArgumentParser.error') as error:
             parse_commandline_args(commandline.split())
 
             # Checked that we printed some kind of error
             error.assert_any_call(ANY)
+
+
+class PagesToBeErasedTestCase(unittest.TestCase):
+    """
+    Tests list of pages chosen to be erased.
+    """
+
+    target = {
+        'base_address': 0x1000,
+        'flash_pages': [
+            [0x0000, 0x1000],
+            [0x1000, 0x1000],
+            [0x2000, 0x1000],
+            [0x3000, 0x1000]
+        ]
+    }
+
+    def test_less_than_one_page(self):
+        less_than_one_page = 10
+        pages = pages_to_be_erased(self.target, less_than_one_page)
+        self.assertEqual(pages, [[0x1000, 0x1000]])
+
+    def test_exactly_one_page(self):
+        size_of_first_page = 0x1000
+        pages = pages_to_be_erased(self.target, size_of_first_page)
+        self.assertEqual(pages, [[0x1000, 0x1000]])
+
+    def test_more_than_one_page(self):
+        more_than_one_page = 0x1000 + 1
+        pages = pages_to_be_erased(self.target, more_than_one_page)
+        self.assertEqual(pages, [[0x1000, 0x1000],
+                                 [0x2000, 0x1000]])
+
+    def test_detect_flash_size_error(self):
+        more_than_flash = 0x3000 + 1
+        self.assertRaises(FlashSizeError, pages_to_be_erased, self.target, more_than_flash)
+
+
