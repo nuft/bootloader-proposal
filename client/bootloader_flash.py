@@ -2,7 +2,6 @@
 """
 Update firmware using CVRA bootloading protocol.
 """
-import page
 import logging
 import commands
 import msgpack
@@ -12,9 +11,7 @@ from sys import exit
 import utils
 import progressbar
 import sys
-
-CHUNK_SIZE = 2048
-
+import yaml
 
 def parse_commandline_args(args=None):
     """
@@ -26,17 +23,10 @@ def parse_commandline_args(args=None):
                         help='Path to the binary file to upload',
                         required=True,
                         metavar='FILE')
-
-    parser.add_argument('-a', '--base-address', dest='base_address',
-                        help='Base address of the firmware',
-                        metavar='ADDRESS',
+    parser.add_argument("-t", "--target",
+                        help="YAML file containing target info",
                         required=True,
-                        # automatically convert value to hex
-                        type=lambda s: int(s, 16))
-
-    parser.add_argument('-c', '--device-class',
-                        dest='device_class',
-                        help='Device class to flash', required=True)
+                        metavar='TARGET')
     parser.add_argument('-r', '--run',
                         help='Run application after flashing',
                         action='store_true')
@@ -47,24 +37,61 @@ def parse_commandline_args(args=None):
 
     return parser.parse_args(args)
 
-
-def flash_binary(fdesc, binary, base_address, device_class, destinations,
-                 page_size=2048):
+def slice_into_chunks(data, chunk_size):
     """
-    Writes a full binary to the flash using the given file descriptor.
+    Slices data into chunks that are at max chunk_size big.
+    """
+    while len(data) > chunk_size:
+        yield data[:chunk_size]
+        data = data[chunk_size:]
+    yield data
 
-    It also takes the binary image, the base address and the device class as
-    parameters.
+class FlashSizeError(RuntimeError):
+    """
+    Error raised when the binary does not fit into the target's flash
+    """
+    pass
+
+def pages_to_be_erased(target, length):
+    pages = target['flash_pages']
+    base = target['base_address']
+
+    # ignore bootloader and config pages
+    addr = pages[0][0]
+    while addr < base:
+        pages.pop(0)
+        addr = pages[0][0]
+
+    if pages[-1][0] - pages[0][0] + pages[0][1] < length:
+        raise FlashSizeError
+
+    erase = []
+    for [addr, size] in pages:
+        if length <= 0:
+            break
+        erase.append([addr, size])
+        length -= size
+
+    return erase
+
+def flash_binary(conn, binary, target, destinations):
+    """
+    Writes a full binary to the flash using the given CAN connection.
+
+    It takes target description dict as argument.
     """
 
     print("Erasing pages...")
     pbar = progressbar.ProgressBar(maxval=len(binary)).start()
+    count = 0
+
+    pages = pages_to_be_erased(target, len(binary))
 
     # First erase all pages
-    for offset in range(0, len(binary), page_size):
-        erase_command = commands.encode_erase_flash_page(base_address + offset,
-                                                         device_class)
-        res = utils.write_command_retry(fdesc, erase_command, destinations)
+    for [page, length] in pages:
+        erase_command = commands.encode_erase_flash_page(page, target['device_class'])
+        print('write_command_retry', erase_command)
+        res = utils.write_command_retry(conn, erase_command, destinations)
 
         failed_boards = [str(id) for id, success in res.items()
                          if not msgpack.unpackb(success)]
@@ -75,7 +102,8 @@ def flash_binary(fdesc, binary, base_address, device_class, destinations,
             logging.critical(msg)
             sys.exit(2)
 
-        pbar.update(offset)
+        count += length
+        pbar.update(count)
 
     pbar.finish()
 
@@ -83,13 +111,13 @@ def flash_binary(fdesc, binary, base_address, device_class, destinations,
     pbar = progressbar.ProgressBar(maxval=len(binary)).start()
 
     # Then write all pages in chunks
-    for offset, chunk in enumerate(page.slice_into_pages(binary, CHUNK_SIZE)):
-        offset *= CHUNK_SIZE
+    for offset, chunk in enumerate(slice_into_chunks(binary, target['chunk_size'])):
+        offset *= target['chunk_size']
         command = commands.encode_write_flash(chunk,
-                                              base_address + offset,
-                                              device_class)
+                                              target['base_address'] + offset,
+                                              target['device_class'])
 
-        res = utils.write_command_retry(fdesc, command, destinations)
+        res = utils.write_command_retry(conn, command, destinations)
         failed_boards = [str(id) for id, success in res.items()
                          if not msgpack.unpackb(success)]
 
@@ -106,10 +134,10 @@ def flash_binary(fdesc, binary, base_address, device_class, destinations,
     config = dict()
     config['application_size'] = len(binary)
     config['application_crc'] = crc32(binary)
-    utils.config_update_and_save(fdesc, config, destinations)
+    utils.config_update_and_save(conn, config, destinations)
 
 
-def check_binary(fdesc, binary, base_address, destinations):
+def check_binary(conn, binary, base_address, destinations):
     """
     Check that the binary was correctly written to all destinations.
 
@@ -120,9 +148,9 @@ def check_binary(fdesc, binary, base_address, destinations):
     expected_crc = crc32(binary)
 
     command = commands.encode_crc_region(base_address, len(binary))
-    utils.write_command(fdesc, command, destinations)
+    utils.write_command(conn, command, destinations)
 
-    reader = utils.read_can_datagrams(fdesc)
+    reader = utils.read_can_datagrams(conn)
 
     boards_checked = 0
 
@@ -144,12 +172,12 @@ def check_binary(fdesc, binary, base_address, destinations):
     return valid_nodes
 
 
-def run_application(fdesc, destinations):
+def run_application(conn, destinations):
     """
     Asks the given node to run the application.
     """
     command = commands.encode_jump_to_main()
-    utils.write_command(fdesc, command, destinations)
+    utils.write_command(conn, command, destinations)
 
 
 def verification_failed(failed_nodes):
@@ -162,14 +190,14 @@ def verification_failed(failed_nodes):
     exit(1)
 
 
-def check_online_boards(fdesc, boards):
+def check_online_boards(conn, boards):
     """
     Returns a set containing the online boards.
     """
     online_boards = set()
 
-    utils.write_command(fdesc, commands.encode_ping(), boards)
-    reader = utils.read_can_datagrams(fdesc)
+    utils.write_command(conn, commands.encode_ping(), boards)
+    reader = utils.read_can_datagrams(conn)
 
     for dt in reader:
         if dt is None:
@@ -179,6 +207,10 @@ def check_online_boards(fdesc, boards):
 
     return online_boards
 
+def read_target_file(path):
+    print('!!!!!!!!!!!!!!!!!')
+    with open(path, 'r') as file:
+        return yaml.load(file.read())
 
 def main():
     """
@@ -188,9 +220,11 @@ def main():
     with open(args.binary_file, 'rb') as input_file:
         binary = input_file.read()
 
-    serial_port = utils.open_connection(args)
+    conn = utils.open_connection(args)
 
-    online_boards = check_online_boards(serial_port, args.ids)
+    target = read_target_file(args.target)
+
+    online_boards = check_online_boards(conn, args.ids)
 
     if online_boards != set(args.ids):
         offline_boards = [str(i) for i in set(args.ids) - online_boards]
@@ -199,12 +233,10 @@ def main():
         exit(2)
 
     print("Flashing firmware (size: {} bytes)".format(len(binary)))
-    flash_binary(serial_port, binary, args.base_address, args.device_class,
-                 args.ids)
+    flash_binary(conn, binary, target, args.ids)
 
     print("Verifying firmware...")
-    valid_nodes_set = set(check_binary(serial_port, binary,
-                                       args.base_address, args.ids))
+    valid_nodes_set = set(check_binary(conn, binary, target['base_address'], args.ids))
     nodes_set = set(args.ids)
 
     if valid_nodes_set == nodes_set:
@@ -213,7 +245,7 @@ def main():
         verification_failed(nodes_set - valid_nodes_set)
 
     if args.run:
-        run_application(serial_port, args.ids)
+        run_application(conn, args.ids)
 
 
 if __name__ == "__main__":
